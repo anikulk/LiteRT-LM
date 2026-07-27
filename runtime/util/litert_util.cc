@@ -43,6 +43,7 @@ absl::StatusOr<OwnedEnvironment> CreateEnvironment(
 
   std::vector<EnvironmentOptions::Option> env_options;
   auto helper = std::make_unique<MagicNumberConfigsHelper>();
+  std::string library_dir;
 
   if (model_resources != nullptr &&
       (backend == Backend::CPU || backend == Backend::GPU)) {
@@ -62,7 +63,6 @@ absl::StatusOr<OwnedEnvironment> CreateEnvironment(
                     engine_settings.GetAudioExecutorSettings()->GetBackend() ==
                         Backend::NPU));
   if (uses_npu) {
-    std::string library_dir;
     bool from_settings = false;
     if (!main_executor_settings.GetLitertDispatchLibDir().empty()) {
       library_dir = main_executor_settings.GetLitertDispatchLibDir();
