@@ -32,8 +32,12 @@ message LlmModelType {
     Gemma4 gemma4 = 8;
     FastVlm fast_vlm = 9;
     Lfm2 lfm2 = 11;
+    MiniCPM5 minicpm5 = 12;
   }
 }
+
+// Model configuration for MiniCPM5.
+message MiniCPM5 {}
 
 // The default model type for the generic model.
 message GenericModel {

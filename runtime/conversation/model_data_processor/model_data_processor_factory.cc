@@ -41,6 +41,8 @@
 #include "runtime/conversation/model_data_processor/generic_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/lfm2_data_processor.h"
 #include "runtime/conversation/model_data_processor/lfm2_data_processor_config.h"
+#include "runtime/conversation/model_data_processor/minicpm5_data_processor.h"
+#include "runtime/conversation/model_data_processor/minicpm5_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
 #include "runtime/conversation/model_data_processor/qwen3_data_processor.h"
 #include "runtime/conversation/model_data_processor/qwen3_data_processor_config.h"
@@ -572,6 +574,17 @@ absl::StatusOr<DataProcessorConfig> CreateLfm2DataProcessorConfig(
   return config;
 }
 
+absl::StatusOr<DataProcessorConfig> CreateMiniCpm5DataProcessorConfig(
+    const proto::LlmModelType& model_type) {
+  if (!model_type.has_minicpm5()) {
+    return absl::InvalidArgumentError(
+        "MiniCPM5 LlmModelType is required to create "
+        "MiniCpm5DataProcessorConfig.");
+  }
+  MiniCpm5DataProcessorConfig config;
+  return config;
+}
+
 absl::StatusOr<DataProcessorConfig> CreateDataProcessorConfigFromLlmModelType(
     const proto::LlmModelType& model_type) {
   switch (model_type.model_type_case()) {
@@ -580,6 +593,8 @@ absl::StatusOr<DataProcessorConfig> CreateDataProcessorConfigFromLlmModelType(
       return CreateGemma3DataProcessorConfig(model_type);
     case proto::LlmModelType::kLfm2:
       return CreateLfm2DataProcessorConfig(model_type);
+    case proto::LlmModelType::kMinicpm5:
+      return CreateMiniCpm5DataProcessorConfig(model_type);
     case proto::LlmModelType::kGemma4:
       return CreateGemma4DataProcessorConfig(model_type);
     case proto::LlmModelType::kQwen3:
@@ -611,6 +626,10 @@ absl::StatusOr<std::unique_ptr<ModelDataProcessor>> CreateModelDataProcessor(
     return Lfm2DataProcessor::Create(std::get<Lfm2DataProcessorConfig>(config),
                                      preface, tokenizer, stop_token_ids,
                                      enable_constrained_decoding);
+  } else if (std::holds_alternative<MiniCpm5DataProcessorConfig>(config)) {
+    ABSL_VLOG(1) << "Creating MiniCpm5DataProcessor";
+    return MiniCpm5DataProcessor::Create(
+        std::get<MiniCpm5DataProcessorConfig>(config), preface);
   } else if (std::holds_alternative<Qwen3DataProcessorConfig>(config)) {
     ABSL_VLOG(1) << "Creating Qwen3DataProcessor";
     return Qwen3DataProcessor::Create(
