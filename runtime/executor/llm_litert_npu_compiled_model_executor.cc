@@ -827,14 +827,32 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
     }
   }
 
+  auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
+
   // Create input buffers for prefill signature.
+  //
+  // KV-cache inputs are allocated from the DECODE signature, not prefill.
+  // Prefill and decode may declare different past-KV lengths that reach the
+  // same total context (split-context: prefill past-KV 16256 + chunk 128,
+  // decode past-KV 16383 + 1, both = 16384). The persistent KV buffer is shared
+  // across both signatures, so it must be allocated at the LARGER (decode)
+  // length; the shorter prefill signature binds a zero-copy sub-view of it. When
+  // both signatures share one length (the common case) decode == prefill and
+  // this is equivalent to the original behavior.
   for (auto input_name : prefill_signature->InputNames()) {
     if (absl::StartsWith(input_name, kv_cache_k_root_name) ||
         absl::StartsWith(input_name, kv_cache_v_root_name) ||
         absl::StartsWith(input_name, kv_cache_c_root_name)) {
+      // Allocate from decode (the max length) when decode also declares this KV
+      // input; otherwise fall back to prefill.
+      const bool decode_has_input =
+          decode_signature.HasValue() &&
+          absl::c_linear_search(decode_signature->InputNames(), input_name);
+      const char* kv_alloc_signature =
+          decode_has_input ? kDecodeSignature : kPrefillSignature;
       LITERT_ASSIGN_OR_RETURN(
           input_kv_cache_buffers[input_name],
-          llm_compiled_model.CreateInputBuffer(kPrefillSignature, input_name));
+          llm_compiled_model.CreateInputBuffer(kv_alloc_signature, input_name));
       input_kv_cache_buffers[input_name].Clear();
     } else {
       LITERT_ASSIGN_OR_RETURN(
@@ -844,14 +862,13 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
     }
   }
   // Create input buffers for decode signature. Skip kv cache input buffers as
-  // they are already created in the prefill signature.
-  auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
+  // they are already created (from the decode signature) above.
   for (auto input_name : decode_signature->InputNames()) {
     if (absl::StartsWith(input_name, kv_cache_k_root_name) ||
         absl::StartsWith(input_name, kv_cache_v_root_name) ||
         absl::StartsWith(input_name, kv_cache_c_root_name)) {
       // Create the input kv cache buffer for the decode signature if it is not
-      // created in the prefill signature.
+      // created above (e.g. a KV input present only in the decode signature).
       if (!input_kv_cache_buffers.contains(input_name)) {
         LITERT_ASSIGN_OR_RETURN(
             input_kv_cache_buffers[input_name],
@@ -947,25 +964,56 @@ LlmLiteRtNpuCompiledModelExecutor::CreateLlmInferenceContextWithBufferSharing(
         continue;
       }
 
-      // The last layer kv cache in the prefill signature has float32 elements,
-      // although it's not used in the model, CompiledModel will complain about
-      // the mismatched buffer size. So we need to correct the buffer size here,
-      // by creating a new buffer with the correct size.
+      // The persistent KV buffer is allocated from the decode signature (the
+      // max length). When prefill and decode declare the same KV length the
+      // buffer exactly matches the prefill port and is shared as-is.
+      //
+      // Two things can make the buffer differ from the prefill port:
+      //   (a) Split-context: the buffer is LONGER on the cache-length dimension
+      //       (decode 16383 vs prefill 16256) but has the same element type and
+      //       is >= the port on every dimension. This is intentional sharing —
+      //       the dispatch layer binds a zero-copy sub-view of the buffer sized
+      //       to the prefill port (see MakePortView in invocation_context.cc),
+      //       so we MUST keep the shared buffer here.
+      //   (b) The last-layer KV cache in the prefill signature has float32
+      //       elements (unused by the model, but CompiledModel validates the
+      //       buffer). Here the element type differs — the shared buffer is
+      //       genuinely incompatible, so we rebuild a correctly-typed prefill
+      //       buffer.
+      // Distinguish the two by element type + per-dimension containment, not by
+      // raw byte size (a longer-but-same-dtype buffer is shareable; a
+      // different-dtype buffer is not, regardless of size).
       LITERT_ASSIGN_OR_RETURN(
           auto input_tensor_type,
           llm_compiled_model.GetInputTensorType(kPrefillSignature, key));
-      LITERT_ASSIGN_OR_RETURN(auto input_tensor_size,
-                              input_tensor_type.Bytes());
-      LITERT_ASSIGN_OR_RETURN(auto input_buffer_size, value.Size());
-      if (input_tensor_size != input_buffer_size) {
+      LITERT_ASSIGN_OR_RETURN(auto buffer_tensor_type, value.TensorType());
+      const auto port_dims = input_tensor_type.Layout().Dimensions();
+      const auto buffer_dims = buffer_tensor_type.Layout().Dimensions();
+      bool buffer_contains_port =
+          input_tensor_type.ElementType() == buffer_tensor_type.ElementType() &&
+          port_dims.size() == buffer_dims.size();
+      if (buffer_contains_port) {
+        for (size_t i = 0; i < port_dims.size(); ++i) {
+          if (buffer_dims[i] < port_dims[i]) {
+            buffer_contains_port = false;
+            break;
+          }
+        }
+      }
+      if (buffer_contains_port) {
+        // Same dtype and the buffer covers the prefill port on every
+        // dimension: share it (identical shape, or a longer split-context
+        // buffer that the dispatch layer sub-views).
+        LITERT_ASSIGN_OR_RETURN(prefill_input_buffers[key], value.Duplicate());
+      } else {
+        // Incompatible (e.g. the fp32 last-layer quirk): rebuild a buffer sized
+        // and typed for the prefill port.
         LITERT_ASSIGN_OR_RETURN(
             auto corrected_input_buffer,
             llm_compiled_model.CreateInputBuffer(kPrefillSignature, key));
         corrected_input_buffer.Clear();
         LITERT_ASSIGN_OR_RETURN(prefill_input_buffers[key],
                                 corrected_input_buffer.Duplicate());
-      } else {
-        LITERT_ASSIGN_OR_RETURN(prefill_input_buffers[key], value.Duplicate());
       }
     }
   }
